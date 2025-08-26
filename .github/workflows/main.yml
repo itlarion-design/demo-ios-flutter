@@ -47,7 +47,6 @@ jobs:
       - name: Flutter pub get
         run: flutter pub get
 
-      # Kiểm tra sớm file .p12 và mật khẩu (decode + verify, không lộ private key)
       - name: Preflight p12 (decode + verify)
         env:
           P12_B64: ${{ secrets.IOS_DISTRIBUTION_P12_BASE64 }}
@@ -58,17 +57,45 @@ jobs:
             echo "Secret IOS_DISTRIBUTION_P12_BASE64 is empty" >&2
             exit 1
           fi
-          # macOS base64 (BSD): -D = decode
-          printf %s "$P12_B64" | base64 -D > dist.p12 || (echo "Base64 decode failed" >&2; exit 1)
 
-          # Xác thực container PKCS#12 với mật khẩu (không in private key)
+          # Decode base64 (macOS BSD base64: -D = decode)
+          printf %s "$P12_B64" | base64 -D > dist.p12 || { echo "Base64 decode failed" >&2; exit 1; }
+
+          # Hash và kích thước để so khớp với file local
+          echo "dist.p12 sha256: $(shasum -a 256 dist.p12 | awk '{print $1}')"
+          echo "dist.p12 size: $(wc -c < dist.p12 | tr -d ' ') bytes"
+
+          # Độ dài mật khẩu (không in nội dung, chỉ số byte)
+          RAW_LEN=$(printf %s "$P12_PW" | wc -c | tr -d ' ')
+          echo "Password length (raw): $RAW_LEN"
+
+          # Thử verify với mật khẩu raw
+          set +e
           /usr/bin/openssl pkcs12 -in dist.p12 -info -noout -passin pass:"$P12_PW"
+          STATUS=$?
 
-          # In thông tin certificate để đối chiếu (public info only)
-          /usr/bin/openssl pkcs12 -in dist.p12 -clcerts -nokeys -passin pass:"$P12_PW" \
+          # Nếu lỗi, loại bỏ CR và cặp nháy bao quanh rồi thử lại
+          if [ $STATUS -ne 0 ]; then
+            P12_PW_NOCR=$(printf %s "$P12_PW" | tr -d '\r')
+            P12_PW_STRIPPED="${P12_PW_NOCR%\"}"; P12_PW_STRIPPED="${P12_PW_STRIPPED#\"}"
+            P12_PW_STRIPPED="${P12_PW_STRIPPED%\'}"; P12_PW_STRIPPED="${P12_PW_STRIPPED#\'}"
+            STRIPPED_LEN=$(printf %s "$P12_PW_STRIPPED" | wc -c | tr -d ' ')
+            echo "Password length (sanitized): $STRIPPED_LEN"
+            echo "Retrying with sanitized password..."
+            /usr/bin/openssl pkcs12 -in dist.p12 -info -noout -passin pass:"$P12_PW_STRIPPED"
+            STATUS=$?
+          fi
+          set -e
+
+          if [ $STATUS -ne 0 ]; then
+            echo "PKCS12 check failed - wrong password or corrupted file." >&2
+            exit $STATUS
+          fi
+
+          # In thông tin certificate (public info)
+          /usr/bin/openssl pkcs12 -in dist.p12 -clcerts -nokeys -passin pass:"${P12_PW_STRIPPED:-$P12_PW}" \
             | /usr/bin/openssl x509 -noout -subject -serial -enddate -fingerprint -sha256
 
-          # Xóa file tạm
           rm -f dist.p12
 
       # Import Apple Distribution certificate (.p12) từ Secrets
