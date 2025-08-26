@@ -20,9 +20,9 @@ jobs:
     runs-on: macos-14
 
     env:
-      # Đặt Bundle ID và Team ID từ Secrets/Variables
-      IOS_BUNDLE_ID: ${{ secrets.IOS_BUNDLE_ID }}
-      APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+      # Non-secret config lấy từ 'Actions > Variables'
+      IOS_BUNDLE_ID: ${{ vars.IOS_BUNDLE_ID }}
+      APPLE_TEAM_ID: ${{ vars.APPLE_TEAM_ID }}
 
     steps:
       - name: Checkout
@@ -47,45 +47,48 @@ jobs:
       - name: Flutter pub get
         run: flutter pub get
 
-      # Import Apple Distribution certificate (.p12) vào keychain
-      - name: Import code signing certificate
+      # Import Apple Distribution certificate (.p12) từ Secrets
+      - name: Import code signing certificate (.p12)
         uses: apple-actions/import-codesign-certs@v1
         with:
           p12-file-base64: ${{ secrets.IOS_DISTRIBUTION_P12_BASE64 }}
           p12-password: ${{ secrets.IOS_DISTRIBUTION_P12_PASSWORD }}
 
-      # Download provisioning profile kiểu App Store cho Bundle ID
-      - name: Download provisioning profiles
-        id: profiles
+      # Tải App Store provisioning profile bằng API Key (không cần Apple ID)
+      - name: Download App Store provisioning profile
         uses: apple-actions/download-provisioning-profiles@v1
         with:
           bundle-id: ${{ env.IOS_BUNDLE_ID }}
-          profile-type: "IOS_APP_STORE"
+          profile-type: IOS_APP_STORE
           issuer-id: ${{ secrets.APPSTORE_ISSUER_ID }}
           api-key-id: ${{ secrets.APPSTORE_KEY_ID }}
           api-private-key: ${{ secrets.APPSTORE_PRIVATE_KEY }}
 
-      # Thiết lập biến build number (CFBundleVersion phải là số nguyên)
+      # Thiết lập build-name và build-number
       - name: Set build numbers
         run: |
           echo "BUILD_NUMBER=${GITHUB_RUN_NUMBER}" >> $GITHUB_ENV
           if [ -n "${{ inputs.version }}" ]; then
             echo "BUILD_NAME=${{ inputs.version }}" >> $GITHUB_ENV
           else
-            # Đọc từ pubspec.yaml nếu không truyền input
             VERSION_IN_PUBSPEC=$(grep '^version:' pubspec.yaml | awk '{print $2}' | cut -d'+' -f1)
             echo "BUILD_NAME=${VERSION_IN_PUBSPEC:-1.0.0}" >> $GITHUB_ENV
           fi
 
-      # Build IPA với code signing đã import + profile đã download
+      # CocoaPods (best effort)
+      - name: Prepare CocoaPods (best effort)
+        run: |
+          cd ios
+          pod repo update || true
+          pod install || true
+
+      # Build IPA
       - name: Build iOS IPA (Release)
         env:
-          # Đảm bảo Xcode dùng Team ID đúng; khuyến nghị set sẵn trong project iOS
           DEVELOPMENT_TEAM: ${{ env.APPLE_TEAM_ID }}
         run: |
           flutter --version
           flutter clean
-          # Tuỳ dự án, bạn có thể cần 'cd ios && pod install --repo-update' nhưng flutter build ipa thường tự xử lý
           flutter build ipa \
             --release \
             --build-name "$BUILD_NAME" \
@@ -95,34 +98,42 @@ jobs:
         id: ipa
         run: |
           IPA_PATH=$(ls build/ios/ipa/*.ipa | head -n 1)
+          if [ -z "$IPA_PATH" ]; then
+            echo "IPA not found" >&2
+            exit 1
+          fi
           echo "ipa-path=$IPA_PATH" >> $GITHUB_OUTPUT
           echo "Found IPA: $IPA_PATH"
 
-      # Cài fastlane (nếu runner chưa có)
       - name: Install fastlane
-        run: |
-          gem install fastlane -NV
+        run: gem install fastlane -NV
 
-      # Cấu hình App Store Connect API key cho fastlane (qua env)
-      - name: Export App Store Connect API key to env
-        run: |
-          echo "APP_STORE_CONNECT_API_KEY_KEY_ID=${{ secrets.APPSTORE_KEY_ID }}" >> $GITHUB_ENV
-          echo "APP_STORE_CONNECT_API_KEY_ISSUER_ID=${{ secrets.APPSTORE_ISSUER_ID }}" >> $GITHUB_ENV
-          # GITHUB_ENV hỗ trợ set multiline theo here-doc
-          {
-            echo "APP_STORE_CONNECT_API_KEY_KEY<<'EOF'"
-            echo "${{ secrets.APPSTORE_PRIVATE_KEY }}"
-            echo "EOF"
-          } >> "$GITHUB_ENV"
-
-      # Upload lên TestFlight
-      - name: Upload to TestFlight (fastlane pilot)
+      # Tạo JSON API key cho fastlane (api_key_path)
+      - name: Create App Store Connect API key JSON
         env:
-          # Không bắt buộc nếu dùng API key, nhưng có thể giúp xác định app
-          FASTLANE_TEAM_ID: ${{ env.APPLE_TEAM_ID }}
+          APPSTORE_PRIVATE_KEY: ${{ secrets.APPSTORE_PRIVATE_KEY }}
+          APPSTORE_KEY_ID: ${{ secrets.APPSTORE_KEY_ID }}
+          APPSTORE_ISSUER_ID: ${{ secrets.APPSTORE_ISSUER_ID }}
+        run: |
+          python3 - <<'PY'
+          import json, os
+          data = {
+            "key_id": os.environ["APPSTORE_KEY_ID"],
+            "issuer_id": os.environ["APPSTORE_ISSUER_ID"],
+            "key": os.environ["APPSTORE_PRIVATE_KEY"],
+            "in_house": False
+          }
+          with open("asc_key.json", "w") as f:
+            json.dump(data, f)
+          print("Wrote asc_key.json")
+          PY
+
+      # Upload TestFlight bằng API key, không cần Apple ID
+      - name: Upload to TestFlight (fastlane pilot, API key only)
         run: |
           fastlane pilot upload \
             --ipa "${{ steps.ipa.outputs.ipa-path }}" \
             --app_identifier "${{ env.IOS_BUNDLE_ID }}" \
+            --api_key_path asc_key.json \
             --changelog "${{ inputs.changelog }}" \
             --skip_waiting_for_build_processing true
