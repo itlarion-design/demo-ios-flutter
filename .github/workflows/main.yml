@@ -47,6 +47,30 @@ jobs:
       - name: Flutter pub get
         run: flutter pub get
 
+      # Kiểm tra sớm file .p12 và mật khẩu (decode + verify, không lộ private key)
+      - name: Preflight p12 (decode + verify)
+        env:
+          P12_B64: ${{ secrets.IOS_DISTRIBUTION_P12_BASE64 }}
+          P12_PW:  ${{ secrets.IOS_DISTRIBUTION_P12_PASSWORD }}
+        run: |
+          set -euo pipefail
+          if [ -z "${P12_B64:-}" ]; then
+            echo "Secret IOS_DISTRIBUTION_P12_BASE64 is empty" >&2
+            exit 1
+          fi
+          # macOS base64 (BSD): -D = decode
+          printf %s "$P12_B64" | base64 -D > dist.p12 || (echo "Base64 decode failed" >&2; exit 1)
+
+          # Xác thực container PKCS#12 với mật khẩu (không in private key)
+          /usr/bin/openssl pkcs12 -in dist.p12 -info -noout -passin pass:"$P12_PW"
+
+          # In thông tin certificate để đối chiếu (public info only)
+          /usr/bin/openssl pkcs12 -in dist.p12 -clcerts -nokeys -passin pass:"$P12_PW" \
+            | /usr/bin/openssl x509 -noout -subject -serial -enddate -fingerprint -sha256
+
+          # Xóa file tạm
+          rm -f dist.p12
+
       # Import Apple Distribution certificate (.p12) từ Secrets
       - name: Import code signing certificate (.p12)
         uses: apple-actions/import-codesign-certs@v1
