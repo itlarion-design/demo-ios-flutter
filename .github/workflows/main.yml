@@ -1,53 +1,47 @@
-name: iOS TestFlight (Flutter)
+name: Build & Release (iOS TestFlight)
 
 on:
-  workflow_dispatch:
-    inputs:
-      build-number:
-        description: "Ghi đè build number (tuỳ chọn, ví dụ: 42)"
-        required: false
-      flavor:
-        description: "Flutter flavor (tuỳ chọn, ví dụ: prod)"
-        required: false
   push:
     tags:
-      - "ios-v*"
+      - "v*"
 
 concurrency:
   group: ios-testflight-${{ github.ref }}
   cancel-in-progress: true
-
 
 jobs:
   build:
     name: Build iOS
     runs-on: macos-14
     env:
-      # Thay bằng Bundle Identifier thực tế của app
-      BUNDLE_ID: com.moazsalem.pillsReminder
+      # THAY bằng Bundle Identifier thực tế của app
+      BUNDLE_ID: com.example.app
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
+      # Lấy Xcode giống workflow bạn đưa
+      - name: Set up Xcode
+        uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: "15.4"
+
+      # Lấy Flutter giống workflow bạn đưa (stable + cache)
       - name: Set up Flutter
         uses: subosito/flutter-action@v2
         with:
           channel: stable
-          flutter-version-file: pubspec.yaml
-          architecture: x64
+          cache: true
 
-      - name: Check Flutter Version
-        run: flutter --version
-
-      - name: Check Xcode Version
-        run: xcodebuild -version
+      - name: Flutter doctor
+        run: flutter doctor -v
 
       - name: Install dependencies
         run: flutter pub get
 
-      # Tạo keychain tạm và import .p12 theo đúng "cách họ làm" (dùng secrets theo ảnh)
-      - name: Install Apple certificate into temporary keychain (manual security)
+      # "Cách họ làm": tự tạo keychain tạm + import .p12 thủ công + add vào search list
+      - name: Install Apple certificate into temporary keychain (manual)
         env:
           IOS_CERT_P12_BASE64: ${{ secrets.IOS_CERT_P12_BASE64 }}
           IOS_CERT_PASSWORD: ${{ secrets.IOS_CERT_PASSWORD }}
@@ -57,7 +51,7 @@ jobs:
           CERTIFICATE_PATH="$RUNNER_TEMP/build_certificate.p12"
           KEYCHAIN_PATH="$RUNNER_TEMP/app-signing.keychain-db"
 
-          # Decode .p12 từ base64 (loại bỏ CR/LF để tránh lỗi)
+          # Decode .p12 (trim CR/LF rồi decode để tránh lỗi)
           printf '%s' "$IOS_CERT_P12_BASE64" | tr -d '\r\n' | base64 --decode > "$CERTIFICATE_PATH"
 
           # Tạo keychain tạm (không mật khẩu) và mở khóa
@@ -76,7 +70,7 @@ jobs:
           # Đưa keychain tạm vào search list để xcodebuild tìm thấy
           security list-keychain -d user -s "$KEYCHAIN_PATH"
 
-      # Tải và cài đặt Provisioning Profile App Store bằng App Store Connect API (dùng 3 secrets theo ảnh)
+      # Tải Provisioning Profile App Store qua App Store Connect API (dùng 3 secrets như ảnh)
       - name: Download provisioning profile (App Store)
         uses: apple-actions/download-provisioning-profiles@v1
         with:
@@ -122,7 +116,6 @@ jobs:
           name: ios-ipa
           path: build/ios/ipa/*.ipa
 
-      # Dọn dẹp keychain tạm sau khi build
       - name: Clean up temporary keychain
         if: ${{ always() }}
         run: |
@@ -131,7 +124,7 @@ jobs:
   release:
     name: Upload IPA to TestFlight
     needs: [build]
-    runs-on: macos-latest
+    runs-on: macos-14
     steps:
       - name: Download IPA artifact
         uses: actions/download-artifact@v4.1.7
@@ -140,7 +133,7 @@ jobs:
           path: build
           merge-multiple: true
 
-      # Lưu .p8 về đúng vị trí để altool/Transporter tự nhận
+      # Đặt .p8 đúng vị trí để altool nhận diện
       - name: Install App Store Connect API key (.p8)
         env:
           APPSTORE_KEY_ID: ${{ secrets.APPSTORE_KEY_ID }}
@@ -148,7 +141,6 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p ~/private_keys
-          # Secret APPSTORE_PRIVATE_KEY là nội dung PEM đầy đủ (BEGIN/END PRIVATE KEY)
           printf '%s' "$APPSTORE_PRIVATE_KEY" > ~/private_keys/AuthKey_${APPSTORE_KEY_ID}.p8
 
       - name: Upload to App Store (TestFlight)
@@ -162,11 +154,3 @@ jobs:
             -f build/ios/ipa/*.ipa \
             --apiKey "$APPSTORE_KEY_ID" \
             --apiIssuer "$APPSTORE_ISSUER_ID"
-
-      # (Tuỳ chọn) Tạo GitHub Release chỉ với IPA. Có thể bỏ nếu không cần.
-      - name: Publish GitHub Release (IPA only)
-        uses: ncipollo/release-action@v1.14.0
-        with:
-          name: ${{ github.ref_name }}
-          tag: ${{ github.ref_name }}
-          artifacts: build/ios/ipa/*.ipa
