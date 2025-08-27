@@ -50,6 +50,48 @@ jobs:
           bundler-cache: false
       - run: gem install fastlane --no-document
 
+      # ===== Pre-check P12 secrets (thêm mới) =====
+      - name: Pre-check P12 with OpenSSL
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Kiểm tra khả năng giải mã PKCS#12 với mật khẩu hiện tại
+          if echo "${{ secrets.IOS_CERT_P12_BASE64 }}" | openssl base64 -d -A | \
+             openssl pkcs12 -noout -info -passin pass:"${{ secrets.IOS_CERT_PASSWORD }}" >/dev/null 2>&1; then
+            echo "OK: P12 và mật khẩu hợp lệ (theo secrets hiện tại)."
+          else
+            echo "FAIL: P12 không hợp lệ hoặc sai mật khẩu (theo secrets hiện tại)."
+            exit 1
+          fi
+
+      - name: Decode P12 and print SHA256
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "${{ secrets.IOS_CERT_P12_BASE64 }}" | openssl base64 -d -A > secret.p12
+          echo "SHA256(secret.p12):"
+          shasum -a 256 secret.p12
+
+      - name: Verify macOS security import (temp keychain)
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Dùng lại file secret.p12 nếu đã có; nếu chưa, tạo lại
+          if [[ ! -f secret.p12 ]]; then
+            echo "${{ secrets.IOS_CERT_P12_BASE64 }}" | openssl base64 -d -A > secret.p12
+          fi
+          security create-keychain -p "" temp.keychain
+          security set-keychain-settings -lut 21600 temp.keychain
+          security unlock-keychain -p "" temp.keychain
+          if security import secret.p12 -k temp.keychain -f pkcs12 -A -T /usr/bin/codesign -T /usr/bin/security -P "${{ secrets.IOS_CERT_PASSWORD }}"; then
+            echo "Import bằng security: OK"
+          else
+            echo "Import bằng security: FAIL"
+            security delete-keychain temp.keychain || true
+            exit 1
+          fi
+          security delete-keychain temp.keychain
+
       # Import iOS Distribution certificate (.p12)
       - name: Import code signing certificate
         uses: apple-actions/import-codesign-certs@v2
