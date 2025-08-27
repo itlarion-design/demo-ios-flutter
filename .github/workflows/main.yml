@@ -17,116 +17,80 @@ concurrency:
   group: ios-testflight-${{ github.ref }}
   cancel-in-progress: true
 
+
 jobs:
-  build-and-upload:
-    name: Build & Upload to TestFlight
-    runs-on: macos-14
+  build:
+    name: Build iOS
+    runs-on: macos-latest
+    env:
+      # Thay bằng Bundle Identifier thực tế của app
+      BUNDLE_ID: com.moazsalem.pillsReminder
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Set up Xcode
-        uses: maxim-lobanov/setup-xcode@v1
-        with:
-          xcode-version: "15.4"
-
       - name: Set up Flutter
         uses: subosito/flutter-action@v2
         with:
           channel: stable
-          cache: true
+          flutter-version-file: pubspec.yaml
+          architecture: x64
 
-      - name: Flutter doctor
-        run: flutter doctor -v
+      - name: Check Flutter Version
+        run: flutter --version
 
-      - name: Flutter pub get
+      - name: Check Xcode Version
+        run: xcodebuild -version
+
+      - name: Install dependencies
         run: flutter pub get
 
-      - name: Install Ruby and Fastlane
-        uses: ruby/setup-ruby@v1
-        with:
-          ruby-version: "3.2"
-          bundler-cache: false
-      - run: gem install fastlane --no-document
-
-      # Chuẩn hoá secrets: loại CR/LF để tránh security import đọc sai mật khẩu
-      - id: normalize
-        name: Normalize secrets (trim CR/LF)
+      # Tạo keychain tạm và import .p12 theo đúng "cách họ làm" (dùng secrets theo ảnh)
+      - name: Install Apple certificate into temporary keychain (manual security)
+        env:
+          IOS_CERT_P12_BASE64: ${{ secrets.IOS_CERT_P12_BASE64 }}
+          IOS_CERT_PASSWORD: ${{ secrets.IOS_CERT_PASSWORD }}
         shell: bash
         run: |
           set -euo pipefail
-          P12_B64_TRIM=$(printf '%s' "${{ secrets.IOS_CERT_P12_BASE64 }}" | tr -d '\r\n')
-          P12_PW_TRIM=$(printf '%s' "${{ secrets.IOS_CERT_PASSWORD }}" | tr -d '\r\n')
-          echo "::add-mask::${P12_PW_TRIM}"
-          echo "p12_b64=${P12_B64_TRIM}" >> "$GITHUB_OUTPUT"
-          echo "p12_pw=${P12_PW_TRIM}" >> "$GITHUB_OUTPUT"
+          CERTIFICATE_PATH="$RUNNER_TEMP/build_certificate.p12"
+          KEYCHAIN_PATH="$RUNNER_TEMP/app-signing.keychain-db"
 
-      # ===== Pre-check P12 secrets (đã dùng bản đã trim) =====
-      - name: Pre-check P12 with OpenSSL
-        shell: bash
-        run: |
-          set -euo pipefail
-          if echo "${{ steps.normalize.outputs.p12_b64 }}" | openssl base64 -d -A | \
-             openssl pkcs12 -noout -info -passin pass:"${{ steps.normalize.outputs.p12_pw }}" >/dev/null 2>&1; then
-            echo "OK: P12 và mật khẩu hợp lệ (theo secrets hiện tại)."
-          else
-            echo "FAIL: P12 không hợp lệ hoặc sai mật khẩu (theo secrets hiện tại)."
-            exit 1
-          fi
+          # Decode .p12 từ base64 (loại bỏ CR/LF để tránh lỗi)
+          printf '%s' "$IOS_CERT_P12_BASE64" | tr -d '\r\n' | base64 --decode > "$CERTIFICATE_PATH"
 
-      - name: Decode P12 and print SHA256
-        shell: bash
-        run: |
-          set -euo pipefail
-          echo "${{ steps.normalize.outputs.p12_b64 }}" | openssl base64 -d -A > secret.p12
-          echo "SHA256(secret.p12):"
-          shasum -a 256 secret.p12
+          # Tạo keychain tạm (không mật khẩu) và mở khóa
+          security create-keychain -p "" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "" "$KEYCHAIN_PATH"
 
-      - name: Verify macOS security import (temp keychain)
-        shell: bash
-        run: |
-          set -euo pipefail
-          security create-keychain -p "" temp.keychain
-          security set-keychain-settings -lut 21600 temp.keychain
-          security unlock-keychain -p "" temp.keychain
-          if security import secret.p12 \
-               -k temp.keychain \
-               -f pkcs12 \
-               -A \
-               -T /usr/bin/codesign \
-               -T /usr/bin/security \
-               -P "${{ steps.normalize.outputs.p12_pw }}"; then
-            echo "Import bằng security: OK"
-          else
-            echo "Import bằng security: FAIL"
-            security delete-keychain temp.keychain || true
-            exit 1
-          fi
-          security delete-keychain temp.keychain
+          # Import .p12 (truyền pass qua file để tránh shell expansion)
+          printf '%s' "$IOS_CERT_PASSWORD" > p12pw.txt
+          security import "$CERTIFICATE_PATH" -P "$(cat p12pw.txt)" -A -t cert -f pkcs12 -k "$KEYCHAIN_PATH"
+          rm -f p12pw.txt
 
-      # Import iOS Distribution certificate (.p12) bằng action, dùng secrets đã trim
-      - name: Import code signing certificate
-        uses: apple-actions/import-codesign-certs@v2
-        with:
-          p12-file-base64: ${{ steps.normalize.outputs.p12_b64 }}
-          p12-password: ${{ steps.normalize.outputs.p12_pw }}
+          # Cho phép codesign/xcodebuild truy cập private key (tránh "User interaction is not allowed")
+          security set-key-partition-list -S apple-tool:,apple: -s -k "" "$KEYCHAIN_PATH"
 
-      # Tải Provisioning Profile App Store qua App Store Connect API
-      - name: Download provisioning profile
+          # Đưa keychain tạm vào search list để xcodebuild tìm thấy
+          security list-keychain -d user -s "$KEYCHAIN_PATH"
+
+      # Tải và cài đặt Provisioning Profile App Store bằng App Store Connect API (dùng 3 secrets theo ảnh)
+      - name: Download provisioning profile (App Store)
         uses: apple-actions/download-provisioning-profiles@v1
         with:
-          bundle-id: ${{ secrets.IOS_BUNDLE_ID }}
+          bundle-id: ${{ env.BUNDLE_ID }}
           profile-type: IOS_APP_STORE
           issuer-id: ${{ secrets.APPSTORE_ISSUER_ID }}
           api-key-id: ${{ secrets.APPSTORE_KEY_ID }}
-          api-private-key: ${{ secrets.APPSTORE_API_KEY_P8 }}
+          api-private-key: ${{ secrets.APPSTORE_PRIVATE_KEY }}
 
-      # (Tuỳ chọn) Ghi đè CFBundleVersion nếu người chạy workflow cung cấp build-number
-      - name: Override build number (optional)
-        if: ${{ inputs.build-number != '' }}
-        working-directory: ios
-        run: /usr/libexec/PlistBuddy -c "Set :CFBundleVersion ${{ inputs['build-number'] }}" ./Runner/Info.plist
+      - name: Pod install (iOS)
+        run: |
+          cd ios
+          pod install --repo-update
+          cd ..
 
       - name: Create ExportOptions.plist
         run: |
@@ -143,52 +107,66 @@ jobs:
             <string>export</string>
             <key>manageAppVersionAndBuildNumber</key>
             <true/>
-            <key>teamID</key>
-            <string>${{ secrets.APPSTORE_TEAM_ID }}</string>
           </dict>
           </plist>
           EOF
 
-      # Build IPA bằng Flutter
-      - name: Build IPA
+      - name: Build iOS (IPA)
         env:
           CI: true
-        run: |
-          if [[ -n "${{ inputs.flavor }}" ]]; then
-            FLAVOR="--flavor ${{ inputs.flavor }}"
-          else
-            FLAVOR=""
-          fi
-          flutter build ipa --release $FLAVOR --export-options-plist=ExportOptions.plist
+        run: flutter build ipa --release --export-options-plist=ExportOptions.plist
 
-      # Tạo file App Store Connect API key JSON cho Fastlane Pilot
-      - name: Create App Store Connect API key JSON
+      - name: Upload IPA artifact
+        uses: actions/upload-artifact@v4.3.3
+        with:
+          name: ios-ipa
+          path: build/ios/ipa/*.ipa
+
+      # Dọn dẹp keychain tạm sau khi build
+      - name: Clean up temporary keychain
+        if: ${{ always() }}
+        run: |
+          security delete-keychain "$RUNNER_TEMP/app-signing.keychain-db" || true
+
+  release:
+    name: Upload IPA to TestFlight
+    needs: [build]
+    runs-on: macos-latest
+    steps:
+      - name: Download IPA artifact
+        uses: actions/download-artifact@v4.1.7
+        with:
+          name: ios-ipa
+          path: build
+          merge-multiple: true
+
+      # Lưu .p8 về đúng vị trí để altool/Transporter tự nhận
+      - name: Install App Store Connect API key (.p8)
         env:
-          P8: ${{ secrets.APPSTORE_PRIVATE_KEY }}
-          KEY_ID: ${{ secrets.APPSTORE_KEY_ID }}
-          ISSUER_ID: ${{ secrets.APPSTORE_ISSUER_ID }}
+          APPSTORE_KEY_ID: ${{ secrets.APPSTORE_KEY_ID }}
+          APPSTORE_PRIVATE_KEY: ${{ secrets.APPSTORE_PRIVATE_KEY }}
         run: |
-          python3 - <<'PY'
-          import json, os
-          data = {
-            "key_id": os.environ["KEY_ID"],
-            "issuer_id": os.environ["ISSUER_ID"],
-            "key": os.environ["P8"]
-          }
-          with open("api_key.json", "w") as f:
-            json.dump(data, f)
-          PY
-          echo "api_key.json created."
+          set -euo pipefail
+          mkdir -p ~/private_keys
+          # Secret APPSTORE_PRIVATE_KEY là nội dung PEM đầy đủ (BEGIN/END PRIVATE KEY)
+          printf '%s' "$APPSTORE_PRIVATE_KEY" > ~/private_keys/AuthKey_${APPSTORE_KEY_ID}.p8
 
-      - name: Upload IPA to TestFlight
+      - name: Upload to App Store (TestFlight)
+        env:
+          APPSTORE_KEY_ID: ${{ secrets.APPSTORE_KEY_ID }}
+          APPSTORE_ISSUER_ID: ${{ secrets.APPSTORE_ISSUER_ID }}
         run: |
-          IPA_PATH=$(ls -1 build/ios/ipa/*.ipa | head -n1)
-          echo "Uploading: $IPA_PATH"
-          fastlane pilot upload \
-            --api_key_path api_key.json \
-            --ipa "$IPA_PATH" \
-            --skip_waiting_for_build_processing true \
-            --skip_submission true
+          set -euo pipefail
+          xcrun altool --upload-app \
+            --type ios \
+            -f build/ios/ipa/*.ipa \
+            --apiKey "$APPSTORE_KEY_ID" \
+            --apiIssuer "$APPSTORE_ISSUER_ID"
 
-      - name: Print success
-        run: echo "✅ Build & upload to TestFlight completed."
+      # (Tuỳ chọn) Tạo GitHub Release chỉ với IPA. Có thể bỏ nếu không cần.
+      - name: Publish GitHub Release (IPA only)
+        uses: ncipollo/release-action@v1.14.0
+        with:
+          name: ${{ github.ref_name }}
+          tag: ${{ github.ref_name }}
+          artifacts: build/ios/ipa/*.ipa
