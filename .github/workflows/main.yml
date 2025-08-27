@@ -50,14 +50,25 @@ jobs:
           bundler-cache: false
       - run: gem install fastlane --no-document
 
-      # ===== Pre-check P12 secrets (thêm mới) =====
+      # Chuẩn hoá secrets: loại CR/LF để tránh security import đọc sai mật khẩu
+      - id: normalize
+        name: Normalize secrets (trim CR/LF)
+        shell: bash
+        run: |
+          set -euo pipefail
+          P12_B64_TRIM=$(printf '%s' "${{ secrets.IOS_CERT_P12_BASE64 }}" | tr -d '\r\n')
+          P12_PW_TRIM=$(printf '%s' "${{ secrets.IOS_CERT_PASSWORD }}" | tr -d '\r\n')
+          echo "::add-mask::${P12_PW_TRIM}"
+          echo "p12_b64=${P12_B64_TRIM}" >> "$GITHUB_OUTPUT"
+          echo "p12_pw=${P12_PW_TRIM}" >> "$GITHUB_OUTPUT"
+
+      # ===== Pre-check P12 secrets (đã dùng bản đã trim) =====
       - name: Pre-check P12 with OpenSSL
         shell: bash
         run: |
           set -euo pipefail
-          # Kiểm tra khả năng giải mã PKCS#12 với mật khẩu hiện tại
-          if echo "${{ secrets.IOS_CERT_P12_BASE64 }}" | openssl base64 -d -A | \
-             openssl pkcs12 -noout -info -passin pass:"${{ secrets.IOS_CERT_PASSWORD }}" >/dev/null 2>&1; then
+          if echo "${{ steps.normalize.outputs.p12_b64 }}" | openssl base64 -d -A | \
+             openssl pkcs12 -noout -info -passin pass:"${{ steps.normalize.outputs.p12_pw }}" >/dev/null 2>&1; then
             echo "OK: P12 và mật khẩu hợp lệ (theo secrets hiện tại)."
           else
             echo "FAIL: P12 không hợp lệ hoặc sai mật khẩu (theo secrets hiện tại)."
@@ -68,7 +79,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          echo "${{ secrets.IOS_CERT_P12_BASE64 }}" | openssl base64 -d -A > secret.p12
+          echo "${{ steps.normalize.outputs.p12_b64 }}" | openssl base64 -d -A > secret.p12
           echo "SHA256(secret.p12):"
           shasum -a 256 secret.p12
 
@@ -76,14 +87,16 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          # Dùng lại file secret.p12 nếu đã có; nếu chưa, tạo lại
-          if [[ ! -f secret.p12 ]]; then
-            echo "${{ secrets.IOS_CERT_P12_BASE64 }}" | openssl base64 -d -A > secret.p12
-          fi
           security create-keychain -p "" temp.keychain
           security set-keychain-settings -lut 21600 temp.keychain
           security unlock-keychain -p "" temp.keychain
-          if security import secret.p12 -k temp.keychain -f pkcs12 -A -T /usr/bin/codesign -T /usr/bin/security -P "${{ secrets.IOS_CERT_PASSWORD }}"; then
+          if security import secret.p12 \
+               -k temp.keychain \
+               -f pkcs12 \
+               -A \
+               -T /usr/bin/codesign \
+               -T /usr/bin/security \
+               -P "${{ steps.normalize.outputs.p12_pw }}"; then
             echo "Import bằng security: OK"
           else
             echo "Import bằng security: FAIL"
@@ -92,12 +105,12 @@ jobs:
           fi
           security delete-keychain temp.keychain
 
-      # Import iOS Distribution certificate (.p12)
+      # Import iOS Distribution certificate (.p12) bằng action, dùng secrets đã trim
       - name: Import code signing certificate
         uses: apple-actions/import-codesign-certs@v2
         with:
-          p12-file-base64: ${{ secrets.IOS_CERT_P12_BASE64 }}
-          p12-password: ${{ secrets.IOS_CERT_PASSWORD }}
+          p12-file-base64: ${{ steps.normalize.outputs.p12_b64 }}
+          p12-password: ${{ steps.normalize.outputs.p12_pw }}
 
       # Tải Provisioning Profile App Store qua App Store Connect API
       - name: Download provisioning profile
@@ -136,7 +149,7 @@ jobs:
           </plist>
           EOF
 
-      # Build IPA bằng Flutter (Xcode sẽ dùng cert + provisioning profile đã import)
+      # Build IPA bằng Flutter
       - name: Build IPA
         env:
           CI: true
@@ -151,7 +164,7 @@ jobs:
       # Tạo file App Store Connect API key JSON cho Fastlane Pilot
       - name: Create App Store Connect API key JSON
         env:
-          P8: ${{ secrets.APPSTORE_API_KEY_P8 }}
+          P8: ${{ secrets.APPSTORE_PRIVATE_KEY }}
           KEY_ID: ${{ secrets.APPSTORE_KEY_ID }}
           ISSUER_ID: ${{ secrets.APPSTORE_ISSUER_ID }}
         run: |
