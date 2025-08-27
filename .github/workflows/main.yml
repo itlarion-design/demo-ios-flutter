@@ -1,13 +1,17 @@
 name: Build & Release (iOS TestFlight)
 
 on:
+  workflow_dispatch:
+    inputs:
+      build-number:
+        description: "Ghi đè build number (tuỳ chọn, ví dụ: 42)"
+        required: false
+      flavor:
+        description: "Flutter flavor (tuỳ chọn, ví dụ: prod)"
+        required: false
   push:
     tags:
-      - "v*"
-
-concurrency:
-  group: ios-testflight-${{ github.ref }}
-  cancel-in-progress: true
+      - "ios-v*"
 
 jobs:
   build:
